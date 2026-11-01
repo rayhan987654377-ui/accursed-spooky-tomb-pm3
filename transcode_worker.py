@@ -56,12 +56,33 @@ def download_file(url, target_path, headers=None):
                         print(f"   Downloading: {downloaded / (1024*1024):.1f} MB / {total_size / (1024*1024):.1f} MB ({pct:.1f}%) @ {speed:.1f} MB/s")
                         last_log = now
 
+def get_drive_offset(upload_url, file_size):
+    """Query Google Drive to find out how many bytes were safely received."""
+    for attempt in range(5):
+        try:
+            r = requests.put(
+                upload_url,
+                headers={"Content-Range": f"bytes */{file_size}"},
+                timeout=30
+            )
+            if r.status_code in (200, 201):
+                return file_size, r.json()
+            if r.status_code == 308:
+                range_header = r.headers.get("Range")
+                if range_header:
+                    last_byte = int(range_header.split("-")[1])
+                    return last_byte + 1, None
+                return 0, None
+        except Exception as e:
+            print(f"      [Status Query Attempt {attempt+1}] Error querying upload status: {e}")
+            time.sleep(2 * (attempt + 1))
+    return 0, None
+
 def upload_to_drive(file_path, folder_id, access_token, mime_type="application/octet-stream"):
     file_name = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)
     print(f"[Drive Upload] Uploading {file_name} ({file_size / (1024*1024):.2f} MB)...")
 
-    # Resumable upload session
     meta = {
         "name": file_name,
         "parents": [folder_id] if folder_id else []
@@ -72,33 +93,93 @@ def upload_to_drive(file_path, folder_id, access_token, mime_type="application/o
         "X-Upload-Content-Type": mime_type,
         "X-Upload-Content-Length": str(file_size)
     }
-    init_res = requests.post(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
-        headers=headers,
-        json=meta,
-        timeout=30
-    )
-    init_res.raise_for_status()
-    upload_url = init_res.headers.get("Location")
 
-    # Upload file in chunks
-    chunk_size = 10 * 1024 * 1024
+    upload_url = None
+    for init_try in range(5):
+        try:
+            init_res = requests.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
+                headers=headers,
+                json=meta,
+                timeout=45
+            )
+            init_res.raise_for_status()
+            upload_url = init_res.headers.get("Location")
+            if upload_url:
+                break
+        except Exception as e:
+            print(f"[Drive Upload] Init try {init_try+1} failed: {e}. Retrying in 3s...")
+            time.sleep(3)
+
+    if not upload_url:
+        raise RuntimeError(f"Could not initiate Google Drive resumable upload session for {file_name}")
+
+    chunk_size = 32 * 1024 * 1024
     with open(file_path, "rb") as f:
         offset = 0
+        last_log_time = time.time()
         while offset < file_size:
+            f.seek(offset)
             chunk = f.read(chunk_size)
             chunk_len = len(chunk)
             up_headers = {
                 "Content-Length": str(chunk_len),
                 "Content-Range": f"bytes {offset}-{offset + chunk_len - 1}/{file_size}"
             }
-            r = requests.put(upload_url, headers=up_headers, data=chunk, timeout=60)
-            offset += chunk_len
-            if r.status_code in (200, 201):
-                res_data = r.json()
-                print(f"[Drive Upload] Done: {file_name} -> ID: {res_data.get('id')}")
-                return res_data.get("id"), file_size
-    raise RuntimeError(f"Upload failed for {file_name}")
+
+            chunk_success = False
+            for retry in range(7):
+                try:
+                    r = requests.put(upload_url, headers=up_headers, data=chunk, timeout=180)
+                    if r.status_code in (200, 201):
+                        res_data = r.json()
+                        print(f"[Drive Upload] Done: {file_name} -> ID: {res_data.get('id')}")
+                        return res_data.get("id"), file_size
+                    elif r.status_code == 308:
+                        offset += chunk_len
+                        chunk_success = True
+                        now = time.time()
+                        if now - last_log_time > 10 or offset >= file_size:
+                            pct = (offset / file_size) * 100
+                            print(f"   [Drive Upload] {offset / (1024*1024):.1f} MB / {file_size / (1024*1024):.1f} MB ({pct:.1f}%)")
+                            last_log_time = now
+                        break
+                    elif r.status_code in (500, 502, 503, 504, 408):
+                        print(f"   [Drive Upload] Server returned HTTP {r.status_code}, checking status in {2*(retry+1)}s...")
+                        time.sleep(2 * (retry + 1))
+                        server_offset, final_data = get_drive_offset(upload_url, file_size)
+                        if final_data and (final_data.get("id")):
+                            print(f"[Drive Upload] Done (recovered): {file_name} -> ID: {final_data.get('id')}")
+                            return final_data.get("id"), file_size
+                        if server_offset > offset:
+                            offset = server_offset
+                            chunk_success = True
+                            break
+                    else:
+                        print(f"   [Drive Upload] Unexpected HTTP {r.status_code}: {r.text[:200]}")
+                        time.sleep(3)
+                except Exception as err:
+                    print(f"   [Drive Upload] Network/SSL error at byte {offset} ({err}), retry {retry+1}/7...")
+                    time.sleep(3 * (retry + 1))
+                    server_offset, final_data = get_drive_offset(upload_url, file_size)
+                    if final_data and final_data.get("id"):
+                        print(f"[Drive Upload] Done (recovered after SSL drop): {file_name} -> ID: {final_data.get('id')}")
+                        return final_data.get("id"), file_size
+                    if server_offset > offset:
+                        offset = server_offset
+                        chunk_success = True
+                        break
+
+            if not chunk_success and offset < file_size:
+                server_offset, final_data = get_drive_offset(upload_url, file_size)
+                if final_data and final_data.get("id"):
+                    return final_data.get("id"), file_size
+                if server_offset > offset:
+                    offset = server_offset
+                    continue
+                raise RuntimeError(f"Upload failed for {file_name} at byte offset {offset} after multiple retries")
+
+    raise RuntimeError(f"Upload loop exited without completion for {file_name}")
 
 def main():
     raw_payload = os.environ.get("EVENT_PAYLOAD", "{}")
