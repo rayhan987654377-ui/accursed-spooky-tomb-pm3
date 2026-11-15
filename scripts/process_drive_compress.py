@@ -453,11 +453,11 @@ def main():
     source_url = payload.get("source_url") or payload.get("sourceUrl")
     source_res = payload.get("source_resolution", "1080p")
     target_resolutions = payload.get("target_resolutions", ["720p"])
-    speed_preset = payload.get("speed_preset") or "veryfast"
     folder_name = payload.get("folder_name", "MHBD_Compressed_Videos")
     callback_url = payload.get("callback_url")
     callback_secret = payload.get("callback_secret")
     drive_cfg = payload.get("drive_config", {})
+    speed_preset = payload.get("speed_preset") or drive_cfg.get("speed_preset") or "veryfast"
 
     log(f"=== Starting Universal Video Compressor ===")
     log(f"Task ID: {task_id} ({short_code})")
