@@ -38,9 +38,38 @@ def callback(url, secret, payload):
     except Exception as e:
         log(f"Callback warning: {e}")
 
+class DriveTokenManager:
+    """Manages Google Drive OAuth access tokens with automatic expiry detection and refresh."""
+    def __init__(self, drive_cfg):
+        self.client_id = drive_cfg.get("client_id")
+        self.client_secret = drive_cfg.get("client_secret")
+        self.refresh_token = drive_cfg.get("refresh_token")
+        self._token = None
+        self._acquired_at = 0
+
+    def get_token(self, force_refresh=False):
+        now = time.time()
+        # Google OAuth tokens expire in 3600s (60 min).
+        # Proactively refresh if older than 2400s (40 min) or forced.
+        if not self._token or force_refresh or (now - self._acquired_at > 2400):
+            if not self.client_id or not self.client_secret or not self.refresh_token:
+                raise RuntimeError("Missing Google Drive OAuth credentials (client_id, client_secret, or refresh_token).")
+            log(f"Refreshing Google Drive access token (forced={force_refresh})...")
+            body = urllib.parse.urlencode({
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "refresh_token": self.refresh_token,
+                "grant_type": "refresh_token",
+            }).encode()
+            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode())
+            self._token = data["access_token"]
+            self._acquired_at = time.time()
+            log("Google Drive access token successfully acquired/refreshed.")
+        return self._token
+
 def get_access_token(client_id, client_secret, refresh_token):
-    if not client_id or not client_secret or not refresh_token:
-        raise RuntimeError("Missing Google Drive OAuth credentials (client_id, client_secret, or refresh_token).")
     body = urllib.parse.urlencode({
         "client_id": client_id,
         "client_secret": client_secret,
@@ -52,7 +81,8 @@ def get_access_token(client_id, client_secret, refresh_token):
         data = json.loads(r.read().decode())
     return data["access_token"]
 
-def get_or_create_drive_folder(folder_name, parent_id, access_token):
+def get_or_create_drive_folder(folder_name, parent_id, token_mgr):
+    access_token = token_mgr.get_token() if hasattr(token_mgr, 'get_token') else token_mgr
     headers = {"Authorization": f"Bearer {access_token}"}
     q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
@@ -61,6 +91,10 @@ def get_or_create_drive_folder(folder_name, parent_id, access_token):
     url = f"https://www.googleapis.com/drive/v3/files?q={urllib.parse.quote(q)}"
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 401 and hasattr(token_mgr, 'get_token'):
+            access_token = token_mgr.get_token(force_refresh=True)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            r = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
             files = r.json().get('files', [])
             if files:
@@ -77,6 +111,10 @@ def get_or_create_drive_folder(folder_name, parent_id, access_token):
     
     try:
         cr = requests.post(create_url, headers=headers, json=meta, timeout=20)
+        if cr.status_code == 401 and hasattr(token_mgr, 'get_token'):
+            access_token = token_mgr.get_token(force_refresh=True)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            cr = requests.post(create_url, headers=headers, json=meta, timeout=20)
         if cr.status_code in (200, 201):
             fid = cr.json()["id"]
             log(f"Created new Drive folder '{folder_name}': {fid}")
@@ -296,7 +334,7 @@ def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
     log(f"Compression to {target_res} complete: {out_size / (1024*1024):.2f} MB")
     return out_size
 
-def upload_file_to_drive(file_path, file_name, folder_id, access_token, cb_fn=None):
+def upload_file_to_drive(file_path, file_name, folder_id, token_mgr, cb_fn=None):
     file_size = os.path.getsize(file_path)
     log(f"Uploading {file_name} ({file_size / (1024*1024):.2f} MB) to Google Drive...")
 
@@ -304,23 +342,41 @@ def upload_file_to_drive(file_path, file_name, folder_id, access_token, cb_fn=No
         "name": file_name,
         "parents": [folder_id] if folder_id else []
     }
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": "application/octet-stream",
-        "X-Upload-Content-Length": str(file_size)
-    }
 
-    init_res = requests.post(
-        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
-        headers=headers,
-        json=meta,
-        timeout=45
-    )
-    init_res.raise_for_status()
-    upload_url = init_res.headers.get("Location")
+    # Initialize resumable upload session with proactive auto-refresh and 401 retry
+    upload_url = None
+    last_err = None
+    for init_try in range(3):
+        # Force fresh token on retry or if older than 40 minutes
+        access_token = token_mgr.get_token(force_refresh=(init_try > 0)) if hasattr(token_mgr, 'get_token') else token_mgr
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/octet-stream",
+            "X-Upload-Content-Length": str(file_size)
+        }
+        try:
+            init_res = requests.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
+                headers=headers,
+                json=meta,
+                timeout=45
+            )
+            if init_res.status_code == 401:
+                log(f"Google Drive upload init returned 401 Unauthorized. Auto-refreshing OAuth token (try {init_try + 1}/3)...")
+                time.sleep(2)
+                continue
+            init_res.raise_for_status()
+            upload_url = init_res.headers.get("Location")
+            if upload_url:
+                break
+        except Exception as e:
+            last_err = e
+            log(f"Resumable session init warning: {e}. Retrying {init_try + 1}/3...")
+            time.sleep(2)
+
     if not upload_url:
-        raise RuntimeError(f"Could not initialize Google Drive resumable upload session for {file_name}")
+        raise RuntimeError(f"Could not initialize Google Drive resumable upload session for {file_name}: {last_err}")
 
     chunk_size = 32 * 1024 * 1024
     with open(file_path, "rb") as f:
@@ -342,10 +398,11 @@ def upload_file_to_drive(file_path, file_name, folder_id, access_token, cb_fn=No
                     if r.status_code in (200, 201):
                         file_id = r.json().get("id")
                         log(f"Uploaded successfully to Drive! File ID: {file_id}")
-                        # Make file public reader
+                        # Make file public reader with fresh token
                         try:
+                            perm_token = token_mgr.get_token() if hasattr(token_mgr, 'get_token') else token_mgr
                             perm_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions?supportsAllDrives=true"
-                            requests.post(perm_url, headers={"Authorization": f"Bearer {access_token}"}, json={"role": "reader", "type": "anyone"}, timeout=15)
+                            requests.post(perm_url, headers={"Authorization": f"Bearer {perm_token}"}, json={"role": "reader", "type": "anyone"}, timeout=15)
                         except Exception:
                             pass
                         return file_id
@@ -413,22 +470,18 @@ def main():
     input_path = os.path.join(work_dir, "input_source.mkv")
 
     try:
-        # Step 1: Refresh Drive Token
+        # Step 1: Initialize Drive Token Manager
         send_update("downloading", 2, "Connecting...")
-        access_token = None
-        if drive_cfg.get("client_id") and drive_cfg.get("refresh_token"):
-            access_token = get_access_token(
-                drive_cfg.get("client_id"),
-                drive_cfg.get("client_secret"),
-                drive_cfg.get("refresh_token")
-            )
-            log("Google Drive access token successfully acquired.")
+        token_mgr = DriveTokenManager(drive_cfg) if (drive_cfg.get("client_id") and drive_cfg.get("refresh_token")) else None
+        if token_mgr:
+            token_mgr.get_token()
 
         # Step 2: Download Source File
         def on_dl_progress(pct, spd):
             send_update("downloading", int(pct * 0.3), spd)
 
-        original_size = download_file(source_url, input_path, access_token=access_token, cb_fn=on_dl_progress)
+        initial_token = token_mgr.get_token() if token_mgr else None
+        original_size = download_file(source_url, input_path, access_token=initial_token, cb_fn=on_dl_progress)
         log(f"Source downloaded: {original_size / (1024*1024):.2f} MB")
         send_update("downloading", 30, "Source Downloaded", original_size=original_size)
 
@@ -439,8 +492,8 @@ def main():
 
         # Step 4: Resolve Target Drive Folder
         target_folder_id = None
-        if access_token:
-            target_folder_id = get_or_create_drive_folder(folder_name, drive_cfg.get("folder_id"), access_token)
+        if token_mgr:
+            target_folder_id = get_or_create_drive_folder(folder_name, drive_cfg.get("folder_id"), token_mgr)
 
         # Step 5: Process Each Selected Resolution
         num_targets = len(target_resolutions)
@@ -462,7 +515,10 @@ def main():
             comp_size = compress_video(input_path, compressed_path, t_res, duration, cb_fn=on_comp_progress)
             total_compressed_size += comp_size
 
-            # Upload to Google Drive
+            # Upload to Google Drive (force fresh token before each upload to guarantee full 3600s validity!)
+            if token_mgr:
+                token_mgr.get_token(force_refresh=True)
+
             up_start = comp_start + comp_span
             up_span = int(0.5 / num_targets * 20)
 
@@ -470,7 +526,7 @@ def main():
                 current_p = up_start + int((pct / 100) * up_span)
                 send_update(f"uploading_{t_res}", current_p, spd, original_size=original_size, compressed_size=total_compressed_size, output_files=output_files)
 
-            drive_file_id = upload_file_to_drive(compressed_path, out_filename, target_folder_id, access_token, cb_fn=on_up_progress)
+            drive_file_id = upload_file_to_drive(compressed_path, out_filename, target_folder_id, token_mgr, cb_fn=on_up_progress)
             drive_link = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
 
             output_files.append({
