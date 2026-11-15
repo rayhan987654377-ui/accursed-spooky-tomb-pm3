@@ -247,30 +247,36 @@ def smart_rename(original_title, target_res):
 
     return f"{new_base}{ext}"
 
-def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
+def compress_video(input_path, output_path, target_res, duration, cb_fn=None, speed_preset="veryfast"):
+    preset_choice = (speed_preset or "veryfast").lower().strip()
+    if preset_choice not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium"):
+        preset_choice = "veryfast"
+
     res_map = {
-        "720p": {"height": 720, "crf": "23", "preset": "medium"},
-        "480p": {"height": 480, "crf": "24", "preset": "medium"},
-        "360p": {"height": 360, "crf": "25", "preset": "faster"},
-        "1080p": {"height": 1080, "crf": "22", "preset": "medium"},
+        "720p": {"height": 720, "crf": "22", "preset": preset_choice},
+        "480p": {"height": 480, "crf": "23", "preset": preset_choice},
+        "360p": {"height": 360, "crf": "24", "preset": preset_choice},
+        "1080p": {"height": 1080, "crf": "21", "preset": preset_choice},
     }
     spec = res_map.get(target_res, res_map["720p"])
     h = spec["height"]
     crf = spec["crf"]
     preset = spec["preset"]
 
-    log(f"Compressing to {target_res} (height: {h}, crf: {crf}, preset: {preset})...")
+    log(f"Compressing to {target_res} (height: {h}, crf: {crf}, preset: {preset}, multi-threaded)...")
 
     # Command preserves:
-    # 1. Video scaled with high quality Lanczos / bicubic scaling
-    # 2. All audio tracks untouched (-map 0:a? -c:a copy) preserving language names and sync
-    # 3. All subtitle tracks untouched (-map 0:s? -c:s copy)
+    # 1. Multi-threaded software decoding & encoding (-threads 0)
+    # 2. Fast bicubic scaling (-vf scale=-2:{h}:flags=bicubic)
+    # 3. All audio tracks untouched (-map 0:a? -c:a copy) preserving language names and sync
+    # 4. All subtitle tracks untouched (-map 0:s? -c:s copy)
     cmd = [
         "ffmpeg", "-y", "-err_detect", "ignore_err",
         "-fflags", "+genpts+discardcorrupt",
+        "-threads", "0",
         "-i", input_path,
         "-map", "0:v:0",
-        "-vf", f"scale=-2:{h}",
+        "-vf", f"scale=-2:{h}:flags=bicubic",
         "-c:v", "libx264",
         "-preset", preset,
         "-crf", crf,
@@ -278,16 +284,22 @@ def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
         "-c:a", "copy",
         "-map", "0:s?",
         "-c:s", "copy",
-        "-max_muxing_queue_size", "2048",
+        "-max_muxing_queue_size", "4096",
         "-progress", "pipe:1",
         output_path
     ]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     last_cb = time.time()
+    curr_fps = "0"
+    curr_speed = "1x"
     for line in proc.stdout:
         line = line.strip()
-        if line.startswith("out_time_ms="):
+        if line.startswith("fps="):
+            curr_fps = line.split("=")[1].strip()
+        elif line.startswith("speed="):
+            curr_speed = line.split("=")[1].strip()
+        elif line.startswith("out_time_ms="):
             try:
                 ms = int(line.split("=")[1])
                 curr_sec = ms / 1000000.0
@@ -295,9 +307,10 @@ def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
                     pct = min(99, int((curr_sec / duration) * 100))
                     now = time.time()
                     if now - last_cb > 3:
-                        log(f"   Compressing {target_res}: {pct}% ({curr_sec:.1f}s / {duration:.1f}s)")
+                        speed_str = f"{curr_speed} ({curr_fps} fps)"
+                        log(f"   Compressing {target_res}: {pct}% ({curr_sec:.1f}s / {duration:.1f}s) @ {speed_str}")
                         if cb_fn:
-                            cb_fn(pct, f"Encoding {target_res}")
+                            cb_fn(pct, f"Encoding {target_res} @ {speed_str}")
                         last_cb = now
             except Exception:
                 pass
@@ -309,9 +322,10 @@ def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
         cmd_fallback = [
             "ffmpeg", "-y", "-err_detect", "ignore_err",
             "-fflags", "+genpts+discardcorrupt",
+            "-threads", "0",
             "-i", input_path,
             "-map", "0:v:0",
-            "-vf", f"scale=-2:{h}",
+            "-vf", f"scale=-2:{h}:flags=bicubic",
             "-c:v", "libx264",
             "-preset", preset,
             "-crf", crf,
@@ -320,7 +334,7 @@ def compress_video(input_path, output_path, target_res, duration, cb_fn=None):
             "-b:a", "128k",
             "-map", "0:s?",
             "-c:s", "copy",
-            "-max_muxing_queue_size", "2048",
+            "-max_muxing_queue_size", "4096",
             output_path
         ]
         ret_fallback = subprocess.run(cmd_fallback)
@@ -439,6 +453,7 @@ def main():
     source_url = payload.get("source_url") or payload.get("sourceUrl")
     source_res = payload.get("source_resolution", "1080p")
     target_resolutions = payload.get("target_resolutions", ["720p"])
+    speed_preset = payload.get("speed_preset") or "veryfast"
     folder_name = payload.get("folder_name", "MHBD_Compressed_Videos")
     callback_url = payload.get("callback_url")
     callback_secret = payload.get("callback_secret")
@@ -449,6 +464,7 @@ def main():
     log(f"Title: {title}")
     log(f"Source Res: {source_res}")
     log(f"Targets: {target_resolutions}")
+    log(f"Speed Preset: {speed_preset}")
     log(f"Target Drive Folder: {folder_name}")
 
     def send_update(stage, progress, speed=None, original_size=0, compressed_size=0, output_files=None, err=None):
@@ -495,10 +511,14 @@ def main():
         if token_mgr:
             target_folder_id = get_or_create_drive_folder(folder_name, drive_cfg.get("folder_id"), token_mgr)
 
-        # Step 5: Process Each Selected Resolution
+        # Step 5: Process Each Selected Resolution with high-speed cascading
+        res_rank = {"1080p": 4, "720p": 3, "480p": 2, "360p": 1}
+        target_resolutions = sorted(target_resolutions, key=lambda r: res_rank.get(r, 0), reverse=True)
+
         num_targets = len(target_resolutions)
         output_files = []
         total_compressed_size = 0
+        last_generated_file = None
 
         for idx, t_res in enumerate(target_resolutions):
             out_filename = smart_rename(title, t_res)
@@ -512,8 +532,16 @@ def main():
                 current_p = comp_start + int((pct / 100) * comp_span)
                 send_update(f"compressing_{t_res}", current_p, spd, original_size=original_size, output_files=output_files)
 
-            comp_size = compress_video(input_path, compressed_path, t_res, duration, cb_fn=on_comp_progress)
+            # High speed cascading: If 720p was already generated, use it as input for 480p/360p
+            # This saves massive CPU cycles decoding 1080p and finishes 480p in just a few minutes!
+            encode_input = input_path
+            if t_res in ("480p", "360p") and last_generated_file and os.path.exists(last_generated_file):
+                log(f"⚡ Cascading encode: Using {last_generated_file} as input for {t_res} for ultra-fast downscale!")
+                encode_input = last_generated_file
+
+            comp_size = compress_video(encode_input, compressed_path, t_res, duration, cb_fn=on_comp_progress, speed_preset=speed_preset)
             total_compressed_size += comp_size
+            last_generated_file = compressed_path
 
             # Upload to Google Drive (force fresh token before each upload to guarantee full 3600s validity!)
             if token_mgr:
